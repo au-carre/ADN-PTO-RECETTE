@@ -1,0 +1,443 @@
+<!--
+  PARTIE FRONT (HTML / JavaScript) de l'application "Grist to DS".
+
+  ATTENTION : ce fichier n'est PAS exécuté par le serveur Python (app.py).
+  Il est envoyé TEL QUEL par app.py (route "/", voir render_template) au
+  NAVIGATEUR de l'utilisateur, et c'est le navigateur qui exécute tout le
+  JavaScript ci-dessous. Ce fichier tourne donc à l'intérieur du widget
+  Grist (dans un <iframe>), pas sur le serveur.
+
+  La seule chose que le serveur Python injecte dans cette page avant de
+  l'envoyer est {{ LABEL_TABLE }} (syntaxe du moteur de templates
+  Jinja2), remplacée par la valeur de la variable d'environnement du
+  même nom. Voir le README.md.
+
+  La table des dossiers n'est plus injectée par le serveur : son nom
+  varie selon la démarche synchronisée dans le document Grist (motif
+  "Demarche_<id>_dossiers"), donc elle est détectée dynamiquement côté
+  navigateur via grist.docApi.listTables() (voir detectDossiersTable
+  ci-dessous).
+
+  Rôle de cette page :
+  - Elle utilise l'API JS de Grist (grist-plugin-api.js) pour savoir sur
+    quel "dossier" (ligne Grist) l'utilisateur est positionné, et pour
+    lire/écrire dans les tables Grist (labels disponibles, labels déjà
+    appliqués au dossier).
+  - Elle affiche un bouton par label possible (ajouter/supprimer).
+  - Quand on clique sur un bouton, elle appelle NOTRE serveur Python en
+    faisant fetch("/create") — jamais l'API de Démarches Simplifiées
+    directement, à cause des règles CORS (voir app.py et le README).
+-->
+<!DOCTYPE html>
+<html lang="fr">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>Modification de labels Grist -> DS</title>
+    <link
+      rel="stylesheet"
+      href="https://cdn.jsdelivr.net/npm/@gouvfr/dsfr@1.13.0/dist/dsfr.min.css"
+    />
+    <style>
+      body {
+        font-family: "Marianne", Arial, sans-serif;
+        padding: 1rem;
+      }
+      .label-buttons {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 0.75rem;
+        margin-top: 1rem;
+      }
+      .spinner {
+        display: flex;
+        justify-content: center;
+        align-items: center;
+        height: 3rem;
+        width: 3rem;
+        margin: 2rem auto;
+      }
+      .spinner::after {
+        content: "";
+        width: 2.5rem;
+        height: 2.5rem;
+        border: 3px solid #ccc;
+        border-top-color: #000091;
+        border-radius: 50%;
+        animation: spin 0.8s linear infinite;
+      }
+      @keyframes spin {
+        to {
+          transform: rotate(360deg);
+        }
+      }
+      .fr-title{
+        font-size:0.9rem;
+      }
+    </style>
+  </head>
+  <body class="fr">
+    <h3 class="fr-title">
+      Appliquer le label au dossier <span id="idDossier"></span> dans Démarche Numérique
+    </h3>
+    <div id="labelContainer" class="label-buttons"></div>
+    <div id="spinner-zone"></div>
+    <div
+      id="error-message"
+      style="
+        display: none;
+        padding: 10px 15px;
+        margin-top: 10px;
+        border: 1px solid #ba2b1e;
+        background-color: #ffd8d2;
+        color: #d0270a;
+        border-radius: 4px;
+        font-size: 0.95rem;
+      "
+    ></div>
+    <div
+      id="success-message"
+      style="
+        display: none;
+        padding: 10px 15px;
+        margin-top: 10px;
+        border: 1px solid #27ae60;
+        background-color: #e9f9ef;
+        color: #1e7e34;
+        border-radius: 4px;
+        font-size: 0.95rem;
+      "
+    ></div>
+
+    <script src="https://docs.getgrist.com/grist-plugin-api.js"></script>
+    <script>
+      grist.ready({ requiredAccess: "full" });
+
+      // Cette valeur vient du serveur Python (app.py, route "/"),
+      // injectée via Jinja2 à partir de la variable d'environnement
+      // LABEL_TABLE. C'est le NOM de la table Grist à utiliser (pas un
+      // identifiant Démarches Simplifiées).
+      const labelTable = "{{ LABEL_TABLE }}";
+
+      console.log("Label table:", labelTable);
+
+      // La table des dossiers, elle, n'est PAS injectée par le serveur :
+      // son nom dépend de la démarche synchronisée dans CE document Grist
+      // (motif "Demarche_<id>_dossiers", ex. Demarche_128651_dossiers),
+      // donc il varie d'un document à l'autre. On la détecte dynamiquement
+      // en listant les tables du document et en cherchant celle qui
+      // correspond au motif.
+      let dossiersTableName = null;
+      const DOSSIERS_TABLE_REGEX = /^Demarche_\d+_dossiers$/i;
+
+      async function detectDossiersTable() {
+        const tables = await grist.docApi.listTables();
+        const matches = tables.filter((t) => DOSSIERS_TABLE_REGEX.test(t));
+        if (matches.length === 0) {
+          throw new Error(
+            "Aucune table de dossiers trouvée (motif attendu : Demarche_<id>_dossiers)"
+          );
+        }
+        if (matches.length > 1) {
+          console.warn(
+            "Plusieurs tables de dossiers trouvées, utilisation de la première :",
+            matches
+          );
+        }
+        return matches[0];
+      }
+
+      // Le jeton DS n'est plus une variable d'environnement du serveur :
+      // il est stocké dans le document Grist (table Configuration,
+      // colonne Tocken_DN) pour pouvoir être changé sans redéployer
+      // l'appli. Le widget le lit ici et le transmet à /create à chaque
+      // appel.
+      let dsToken = null;
+      const TOKEN_TABLE = "Configuration";
+
+      async function fetchDsToken() {
+        const tableData = await grist.docApi.fetchTable(TOKEN_TABLE);
+        const tokens = tableData?.Tocken_DN || [];
+        if (!tokens[0]) {
+          throw new Error(
+            "Veuillez de saisir le token DN ou contacter l'administrateur à l'en saisir"
+          );
+        }
+        return tokens[0];
+      }
+
+      // --- SOFT LOCK VARIABLES ---
+      let isUpdating = false; // active during button operation
+      let isSoftLocked = false; // blocks UI rebuilds during refresh
+
+      const sendToDS = async (docId, labelId, exists) => {
+        const query = !exists
+          ? `mutation DossierAjouterLabel { dossierAjouterLabel(input: { dossierId: "${docId}", labelId: "${labelId}" }) { clientMutationId } }`
+          : `mutation DossierSupprimerLabel { dossierSupprimerLabel(input: { dossierId: "${docId}", labelId: "${labelId}" }) { clientMutationId } }`;
+        try {
+          const res = await fetch("/create", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ query, dsToken }),
+          });
+          const data = await res.json();
+          if (data?.errors?.length > 0) throw new Error(data.errors[0].message);
+        } catch (e) {
+          console.error("Response error from external API:", e);
+          throw e;
+        }
+      };
+
+      function showSpinner(container) {
+        container.innerHTML = '<div class="spinner"></div>';
+      }
+      function hideSpinner(container) {
+        const spinner = container.querySelector(".spinner");
+        if (spinner) spinner.remove();
+      }
+
+      function normalize(str) {
+        return String(str)
+          .normalize("NFD")
+          .replace(/[\u0300-\u036f]/g, "")
+          .replace(/["'\[\]]/g, "")
+          .trim()
+          .toLowerCase();
+      }
+
+      function parseLabelNames(raw) {
+        if (!raw) return [];
+        return String(raw)
+          .replace(/["'\[\]]/g, "")
+          .trim()
+          .split(/\s*,\s*/)
+          .map(normalize)
+          .filter(Boolean);
+      }
+
+      function hasLabel(rawLabelNames, label) {
+        return parseLabelNames(rawLabelNames).includes(normalize(label));
+      }
+
+      async function updateDossierLabel(dossierId, label, action) {
+        try {
+          const dossiersTable = await grist.docApi.fetchTable(
+            dossiersTableName
+          );
+          const rowIds = dossiersTable.id;
+          const dossierIds = dossiersTable.dossier_id;
+          const labels = dossiersTable.label_names;
+
+          const index = dossierIds.findIndex((id) => id == dossierId);
+          if (index === -1) {
+            console.error("⚠️ Dossier non trouvé :", dossierId);
+            return;
+          }
+
+          const rowId = rowIds[index];
+          const currentValue = labels[index] || "";
+          const parsed = currentValue
+            .split(/\s*,\s*/)
+            .map((s) => s.trim())
+            .filter(Boolean);
+
+          let newValue;
+          if (action === "add") {
+            if (!parsed.map(normalize).includes(normalize(label.name)))
+              parsed.push(label.name);
+            newValue = parsed.join(", ");
+          } else {
+            const labelNorm = normalize(label.name);
+            newValue = parsed
+              .filter((l) => normalize(l) !== labelNorm)
+              .join(", ");
+          }
+
+          await grist.docApi.applyUserActions([
+            [
+              "UpdateRecord",
+              dossiersTableName,
+              rowId,
+              { label_names: newValue },
+            ],
+          ]);
+          return newValue;
+        } catch (err) {
+          console.error("Erreur lors de la mise à jour du dossier :", err);
+          throw err;
+        }
+      }
+
+      async function loadLabels() {
+        try {
+          const tableData = await grist.docApi.fetchTable(labelTable);
+          const labels = tableData?.Label || tableData?.name || [];
+          const ids = tableData?.Id_DS || tableData?.id || [];
+
+          console.log("tableData:",tableData);
+          console.log("labels:",labels);
+          console.log("ids:",ids);
+
+          return Array.isArray(labels) && Array.isArray(ids)
+            ? labels.map((label, i) => ({ id: ids[i], name: labels[i] }))
+            : [];
+        } catch (err) {
+          console.error("Erreur lors du chargement des labels :", err);
+          return [];
+        }
+      }
+
+      async function displayLabels(selectedRecord) {
+        if (isSoftLocked) return; // ✅ prevent UI rebuild during update
+
+        const container = document.getElementById("labelContainer");
+        container.innerHTML = "";
+
+        if (!isUpdating) {
+          document.getElementById("error-message").style.display = "none";
+          document.getElementById("success-message").style.display = "none";
+        }
+
+        const labels = await loadLabels();
+        if (!labels.length) {
+          container.innerHTML =
+            "<p>Veuillez paramétrer les labels dans la table LABELS</p>";
+          return;
+        }
+
+        const dossierId = selectedRecord?.Dossier_Lie_Dossier_Id;
+        const rawLabelNames = selectedRecord?.Dossier_Lie_Label || "";
+        if (!dossierId) {
+          container.innerHTML = "<p>Aucun dossier lié à ce champ.</p>";
+          return;
+        }
+
+        labels.forEach((label) => {
+          const exists = hasLabel(rawLabelNames, label.name);
+          const btn = document.createElement("button");
+          btn.classList.add("fr-btn", "fr-btn--sm");
+          if (exists) {
+            btn.classList.add("fr-btn--secondary");
+            btn.textContent = `Supprimer ${label.name}`;
+            btn.dataset.action = "remove";
+          } else {
+            btn.classList.add("fr-btn--primary");
+            btn.textContent = `Ajouter ${label.name}`;
+            btn.dataset.action = "add";
+          }
+
+          btn.addEventListener("click", async (event) => {
+            event.stopPropagation();
+            isUpdating = true;
+            isSoftLocked = true;
+
+            document.getElementById("error-message").style.display = "none";
+            document.getElementById("success-message").style.display = "none";
+
+            const allButtons = container.querySelectorAll("button");
+            allButtons.forEach((b) => (b.disabled = true));
+            showSpinner(document.getElementById("spinner-zone"));
+
+            try {
+              let existsNow = hasLabel(
+                selectedRecord.Dossier_Lie_Label,
+                label.name
+              );
+              await sendToDS(dossierId, label.id, existsNow);
+
+              const newValue = await updateDossierLabel(
+                dossierId,
+                label,
+                existsNow ? "remove" : "add"
+              );
+              selectedRecord.Dossier_Lie_Label = newValue;
+
+              existsNow = hasLabel(newValue, label.name);
+              if (existsNow) {
+                btn.classList.remove("fr-btn--primary");
+                btn.classList.add("fr-btn--secondary");
+                btn.textContent = `Supprimer ${label.name}`;
+                btn.dataset.action = "remove";
+              } else {
+                btn.classList.remove("fr-btn--secondary");
+                btn.classList.add("fr-btn--primary");
+                btn.textContent = `Ajouter ${label.name}`;
+                btn.dataset.action = "add";
+              }
+
+              const successBox = document.getElementById("success-message");
+              successBox.textContent = `✅ Le label ${label.name} a été ${
+                existsNow ? "ajouté" : "supprimé"
+              } avec succès dans démarche numerique.gouv.fr`;
+              successBox.style.display = "block";
+            } catch (err) {
+              const errorBox = document.getElementById("error-message");
+              errorBox.textContent = "Erreur : " + err;
+              errorBox.style.display = "block";
+            } finally {
+              hideSpinner(document.getElementById("spinner-zone"));
+              allButtons.forEach((b) => (b.disabled = false));
+              isUpdating = false;
+              setTimeout(() => {
+                isSoftLocked = false;
+              }, 300); // ✅ give Grist refresh time
+            }
+          });
+
+          container.appendChild(btn);
+        });
+      }
+
+      let recordLock = false;
+      let dossiersTableReady = null; // Promise résolue une fois la table détectée
+      let dsTokenReady = null; // Promise résolue une fois le token DS lu
+
+      grist.onRecord(async (record) => {
+        if (recordLock) return;
+        recordLock = true;
+        const container = document.getElementById("labelContainer");
+
+        if (!record) {
+          container.innerHTML = "<p>Aucun champ sélectionné.</p>";
+          recordLock = false;
+          return;
+        }
+
+        // Détection/lecture paresseuse, une seule fois chacune : on ne
+        // sait dialoguer avec le document (listTables/fetchTable) qu'une
+        // fois grist.ready() pris en compte.
+        if (!dossiersTableReady) {
+          dossiersTableReady = detectDossiersTable();
+        }
+        if (!dsTokenReady) {
+          dsTokenReady = fetchDsToken();
+        }
+        try {
+          [dossiersTableName, dsToken] = await Promise.all([
+            dossiersTableReady,
+            dsTokenReady,
+          ]);
+        } catch (err) {
+          console.error("Erreur lors de l'initialisation :", err);
+          const errorBox = document.getElementById("error-message");
+          errorBox.textContent = "Erreur : " + err.message;
+          errorBox.style.display = "block";
+          dossiersTableReady = null; // permet de réessayer au prochain record
+          dsTokenReady = null;
+          recordLock = false;
+          return;
+        }
+
+        document.getElementById("idDossier").innerText = record.dossier_number;
+
+        if (!isSoftLocked) {
+          document.getElementById("error-message").style.display = "none";
+          document.getElementById("success-message").style.display = "none";
+        }
+
+        await displayLabels(record);
+        recordLock = false;
+      });
+    </script>
+  </body>
+</html>
