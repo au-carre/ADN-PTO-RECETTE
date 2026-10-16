@@ -170,18 +170,77 @@
       let isUpdating = false; // active during button operation
       let isSoftLocked = false; // blocks UI rebuilds during refresh
 
+      function normalizeDsId(value, description) {
+        let id = value;
+
+        if (Array.isArray(id)) {
+          if (id.length !== 1) {
+            throw new Error(`${description} doit contenir un seul identifiant DS.`);
+          }
+          [id] = id;
+        }
+
+        if (typeof id === "string") {
+          id = id.trim();
+          if (id.startsWith("[") || id.endsWith("]")) {
+            const match = id.match(/^\[\s*(['"])(.*?)\1\s*\]$/);
+            if (!match) {
+              throw new Error(
+                `${description} doit contenir un seul identifiant DS.`
+              );
+            }
+            id = match[2].trim();
+          }
+        }
+
+        if (
+          (typeof id !== "string" && typeof id !== "number") ||
+          String(id).trim() === ""
+        ) {
+          throw new Error(`${description} est manquant ou invalide.`);
+        }
+
+        return String(id).trim();
+      }
+
       const sendToDS = async (docId, labelId, exists) => {
-        const query = !exists
-          ? `mutation DossierAjouterLabel { dossierAjouterLabel(input: { dossierId: "${docId}", labelId: "${labelId}" }) { clientMutationId } }`
-          : `mutation DossierSupprimerLabel { dossierSupprimerLabel(input: { dossierId: "${docId}", labelId: "${labelId}" }) { clientMutationId } }`;
+        const operationName = exists
+          ? "dossierSupprimerLabel"
+          : "dossierAjouterLabel";
+        const inputType = exists
+          ? "DossierSupprimerLabelInput"
+          : "DossierAjouterLabelInput";
+        const query = `mutation ${operationName}($input: ${inputType}!) {
+          ${operationName}(input: $input) {
+            dossier { id }
+            label { name }
+            errors { message }
+          }
+        }`;
         try {
           const res = await fetch("/create", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ query, dsToken }),
+            body: JSON.stringify({
+              query,
+              operationName,
+              variables: { input: { dossierId: docId, labelId } },
+              dsToken,
+            }),
           });
           const data = await res.json();
-          if (data?.errors?.length > 0) throw new Error(data.errors[0].message);
+          if (!res.ok || data?.errors?.length > 0) {
+            const message =
+              data?.errors?.map((error) => error.message).join("; ") ||
+              `Réponse HTTP ${res.status}`;
+            throw new Error(message);
+          }
+          const mutationErrors =
+            data?.data?.[operationName]?.errors?.map((error) => error.message) ||
+            [];
+          if (mutationErrors.length > 0) {
+            throw new Error(mutationErrors.join("; "));
+          }
         } catch (e) {
           console.error("Response error from external API:", e);
           throw e;
@@ -228,7 +287,11 @@
           const dossierIds = dossiersTable.dossier_id;
           const labels = dossiersTable.label_names;
 
-          const index = dossierIds.findIndex((id) => id == dossierId);
+          const index = dossierIds.findIndex(
+            (id) =>
+              id != null &&
+              normalizeDsId(id, "Identifiant de dossier") === dossierId
+          );
           if (index === -1) {
             console.error("⚠️ Dossier non trouvé :", dossierId);
             return;
@@ -343,10 +406,22 @@
                 selectedRecord.Dossier_Lie_Label,
                 label.name
               );
-              await sendToDS(dossierId, label.id, existsNow);
+              const normalizedDossierId = normalizeDsId(
+                dossierId,
+                "Identifiant de dossier"
+              );
+              const normalizedLabelId = normalizeDsId(
+                label.id,
+                "Identifiant de label"
+              );
+              await sendToDS(
+                normalizedDossierId,
+                normalizedLabelId,
+                existsNow
+              );
 
               const newValue = await updateDossierLabel(
-                dossierId,
+                normalizedDossierId,
                 label,
                 existsNow ? "remove" : "add"
               );
