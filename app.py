@@ -74,13 +74,21 @@ def create_post():
     # Tocken_DN) : le widget le lit via grist.docApi et le transmet ici,
     # il n'est plus configuré côté serveur.
     DS_TOKEN = (payload.get('dsToken') or '').strip()
+    if not DS_TOKEN:
+        return jsonify({'error': 'Token DS manquant'}), 400
 
     # Standard headers for JSON payload
     headers = {
-        "Content-Type": "application/json"
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {DS_TOKEN}",
     }
 
     query = payload.get('query')
+    graphql_payload = {'query': query}
+    if 'operationName' in payload:
+        graphql_payload['operationName'] = payload['operationName']
+    if 'variables' in payload:
+        graphql_payload['variables'] = payload['variables']
 
     # Add Authorization header if token is provided
     if DS_TOKEN:
@@ -90,7 +98,12 @@ def create_post():
         # Appel réel, côté serveur, vers l'API GraphQL de Démarches
         # Simplifiées (DS_TARGET). C'est cet appel qui serait bloqué par
         # CORS s'il était fait directement depuis le JS du navigateur.
-        r = requests.post(DS_TARGET,  json={"query": query}, headers=headers, timeout=10)
+        r = requests.post(
+            DS_TARGET,
+            json=graphql_payload,
+            headers=headers,
+            timeout=10
+        )
         return Response(
             r.text,                     # decode content to string
             status=r.status_code,
